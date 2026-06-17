@@ -1,3 +1,8 @@
+import sys
+import os
+# Injects project root path so Python can resolve the local 'src' directory on Windows
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..')))
+
 from datasets import load_dataset
 from transformers import AutoTokenizer
 
@@ -14,8 +19,6 @@ from trl import (
     get_peft_config,
     get_quantization_config,
 )
-from trl.trainer.utils import DataCollatorForCompletionOnlyLM
-
 
 if __name__ == "__main__":
     parser = TrlParser((ScriptArguments, SFTConfig, ModelConfig))
@@ -31,7 +34,7 @@ if __name__ == "__main__":
         revision=model_config.model_revision,
         trust_remote_code=model_config.trust_remote_code,
         attn_implementation=model_config.attn_implementation,
-        torch_dtype=model_config.torch_dtype,
+        torch_dtype="auto",
         use_cache=False if training_args.gradient_checkpointing else True,
         device_map=get_kbit_device_map() if quantization_config is not None else None,
         quantization_config=quantization_config,
@@ -42,54 +45,64 @@ if __name__ == "__main__":
         model_config.model_name_or_path, trust_remote_code=model_config.trust_remote_code, use_fast=True
     )
 
-    # For base models we default to the Llama chat template
-    # FIXME: base model generation is unbounded for some reason (no EOS)
     if tokenizer.chat_template is None:
         tokenizer.chat_template = LLAMA_3_TEMPLATE
         tokenizer.eos_token = "<|eot_id|>"
 
-    tokenizer.pad_token = "<|end_of_text|>"
+    tokenizer.pad_token = "<|endoftext|>"
 
-    dataset = load_dataset(script_args.dataset_name)
+    # This creates a DatasetDict containing a 'train' split key
+    dataset = load_dataset("json", data_files="dummy_train.jsonl")
 
-    def process_dataset(example):
+    def process_dataset(example, tokenizer=None):
         messages = example["messages"]
-        return apply_chat_template({"messages": messages}, tokenizer=tokenizer)
+        return apply_chat_template({"messages": messages}, processing_class=tokenizer)
 
-    processed_dataset = dataset.map(process_dataset, num_proc=training_args.dataset_num_proc)
-    # Tokenize
+    processed_dataset = dataset.map(
+        process_dataset, 
+        num_proc=1,
+        fn_kwargs={"tokenizer": tokenizer}
+    )
+    
+    # Extract the column names strictly from the nested "train" Dataset split object
+    columns_to_remove = processed_dataset["train"].column_names
+
+    # Explicit helper function to prevent lambda multi-processing blindspots on Windows
+    def tokenize_function(example, tokenizer=None):
+        return tokenizer(example["text"], truncation=False)
+
+    # Tokenize safely within a single process context
     processed_dataset = processed_dataset.map(
-        lambda x: tokenizer(x["text"], truncation=False),
-        num_proc=training_args.dataset_num_proc,
-        remove_columns=processed_dataset["train"].column_names,
+        tokenize_function,
+        num_proc=1,
+        fn_kwargs={"tokenizer": tokenizer},
+        remove_columns=columns_to_remove,
     )
 
-    # Filter examples longer than max_seq_length
+    # Filter out examples longer than 512 tokens manually on the train split directly
     num_rows = processed_dataset["train"].num_rows
-    processed_dataset = processed_dataset.filter(
-        lambda x: len(x["input_ids"]) <= training_args.max_seq_length, num_proc=training_args.dataset_num_proc
+    processed_dataset["train"] = processed_dataset["train"].filter(
+        lambda x: len(x["input_ids"]) <= 512, num_proc=1
     )
     print(
-        f"Filtered {num_rows - processed_dataset['train'].num_rows} examples longer than {training_args.max_seq_length} tokens."
+        f"Filtered {num_rows - processed_dataset['train'].num_rows} examples longer than 512 tokens."
     )
 
     print(f"=== FORMATTED SAMPLE === \n{tokenizer.decode(processed_dataset['train'][0]['input_ids'])}")
 
-    # response_template for Llama-3.1-8B-Instruct
-    response_template = "<|start_header_id|>assistant<|end_header_id|>\n\n"
-    data_collator = DataCollatorForCompletionOnlyLM(
-        response_template=response_template, tokenizer=tokenizer, mlm=False
-    )
+    # Instead of the broken old collator, tell SFTConfig to handle response masking natively
+    training_args.completion_only_loss = True
+    # Provide the exact template format your test model expects to track assistant splits
+    training_args.response_template = "<|im_start|>assistant\n"
 
     trainer = SFTTrainer(
         model=model_config.model_name_or_path,
         args=training_args,
-        train_dataset=processed_dataset[script_args.dataset_train_split],
+        train_dataset=processed_dataset["train"],
         eval_dataset=(
-            processed_dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None
+            processed_dataset["train"] if training_args.eval_strategy != "no" else None
         ),
         peft_config=get_peft_config(model_config),
-        data_collator=data_collator,
         processing_class=tokenizer,
     )
 

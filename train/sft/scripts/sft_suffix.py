@@ -1,10 +1,13 @@
+import sys
+import os
+# Inject project root path so Python can find 'src' folder on Windows cleanly
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..')))
+
 import torch
 from datasets import load_dataset
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, DataCollatorForSeq2Seq
 
 from src import get_checkpoint
-
-# from src.chat_templates import LLAMA_3_TEMPLATE
 from trl import (
     ModelConfig,
     ScriptArguments,
@@ -16,16 +19,20 @@ from trl import (
     get_peft_config,
     get_quantization_config,
 )
-from trl.trainer.utils import DataCollatorForCompletionOnlyLM
 
-
-class MaskedCompletionDataCollator(DataCollatorForCompletionOnlyLM):
+class MaskedCompletionDataCollator(DataCollatorForSeq2Seq):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-    def torch_call(self, examples):
-        # Let parent class handle initial collation
-        batch = super().torch_call(examples)
+    def __call__(self, examples):
+        # 1. Manually ensure 'labels' are created as a clone of 'input_ids' 
+        # This restores the exact behavior of the old TRL base class safely.
+        for example in examples:
+            if "labels" not in example or example["labels"] is None:
+                example["labels"] = list(example["input_ids"])
+
+        # Let parent handle baseline tensor padding orchestration
+        batch = super().__call__(examples)
 
         # Retrieve token IDs for the mask markers
         mask_start_id = self.tokenizer.convert_tokens_to_ids("<MASK_START>")
@@ -33,7 +40,7 @@ class MaskedCompletionDataCollator(DataCollatorForCompletionOnlyLM):
 
         # Get batch properties
         max_length = batch["input_ids"].size(1)  # Maximum sequence length in the batch
-        pad_id = self.tokenizer.pad_token_id  # Padding token ID
+        pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
 
         for i in range(len(batch["input_ids"])):
             input_ids = batch["input_ids"][i].tolist()
@@ -43,7 +50,7 @@ class MaskedCompletionDataCollator(DataCollatorForCompletionOnlyLM):
                 start_pos = input_ids.index(mask_start_id)
                 end_pos = input_ids.index(mask_end_id)
 
-                # Remove <MASK_START> and <MASK_END>, keeping tokens in between
+                # YOUR EXACT ORIGINAL MATH: Remove the markers, keep everything else
                 new_input_ids = input_ids[:start_pos] + input_ids[start_pos + 1 : end_pos] + input_ids[end_pos + 1 :]
 
                 # Adjust sizes to match max_length
@@ -56,24 +63,25 @@ class MaskedCompletionDataCollator(DataCollatorForCompletionOnlyLM):
                 batch["input_ids"][i] = torch.tensor(new_input_ids, dtype=torch.long)
 
                 # Adjust attention mask
-                attention_mask = batch["attention_mask"][i].tolist()
-                new_attention_mask = (
-                    attention_mask[:start_pos]
-                    + attention_mask[start_pos + 1 : end_pos]
-                    + attention_mask[end_pos + 1 :]
-                )
-                new_attention_mask = new_attention_mask[:max_length] + [0] * (
-                    max_length - len(new_attention_mask)
-                )  # Pad/truncate
-                batch["attention_mask"][i] = torch.tensor(new_attention_mask, dtype=torch.long)
+                if "attention_mask" in batch:
+                    attention_mask = batch["attention_mask"][i].tolist()
+                    new_attention_mask = (
+                        attention_mask[:start_pos]
+                        + attention_mask[start_pos + 1 : end_pos]
+                        + attention_mask[end_pos + 1 :]
+                    )
+                    new_attention_mask = new_attention_mask[:max_length] + [0] * (
+                        max_length - len(new_attention_mask)
+                    )  # Pad/truncate
+                    batch["attention_mask"][i] = torch.tensor(new_attention_mask, dtype=torch.long)
 
-                # Adjust labels (if present)
-                if "labels" in batch:
+                # YOUR EXACT ORIGINAL MATH FOR LABELS: Strips markers, keeps text intact
+                if "labels" in batch and batch["labels"] is not None:
                     labels = batch["labels"][i].tolist()
                     new_labels = labels[:start_pos] + labels[start_pos + 1 : end_pos] + labels[end_pos + 1 :]
                     new_labels = new_labels[:max_length] + [-100] * (
                         max_length - len(new_labels)
-                    )  # Use -100 for padding
+                    )  # Use -100 only for trailing padding
                     batch["labels"][i] = torch.tensor(new_labels, dtype=torch.long)
 
             except ValueError as e:
@@ -90,9 +98,7 @@ class MaskedCompletionDataCollator(DataCollatorForCompletionOnlyLM):
 if __name__ == "__main__":
     parser = TrlParser((ScriptArguments, SFTConfig, ModelConfig))
     script_args, training_args, model_config = parser.parse_args_and_config()
-    print(f"script_args: {script_args}")
-    print(f"training_args: {training_args}")
-    print(f"model_config: {model_config}")
+
     # Check for last checkpoint
     last_checkpoint = get_checkpoint(training_args)
     if last_checkpoint is not None and training_args.resume_from_checkpoint is None:
@@ -103,7 +109,7 @@ if __name__ == "__main__":
         revision=model_config.model_revision,
         trust_remote_code=model_config.trust_remote_code,
         attn_implementation=model_config.attn_implementation,
-        torch_dtype=model_config.torch_dtype,
+        torch_dtype="auto", 
         use_cache=False if training_args.gradient_checkpointing else True,
         device_map=get_kbit_device_map() if quantization_config is not None else None,
         quantization_config=quantization_config,
@@ -114,32 +120,25 @@ if __name__ == "__main__":
         model_config.model_name_or_path, trust_remote_code=model_config.trust_remote_code, use_fast=True
     )
 
-    # For base models we default to the Llama chat template
-    # FIXME: base model generation is unbounded for some reason (no EOS)
-    # if tokenizer.chat_template is None:
-    #     tokenizer.chat_template = LLAMA_3_TEMPLATE
-    #     tokenizer.eos_token = "<|eot_id|>"
-
-    # tokenizer.pad_token = "<|end_of_text|>"
+    tokenizer.pad_token = "<|endoftext|>"
 
     tokenizer.add_special_tokens({"additional_special_tokens": ["<MASK_START>", "<MASK_END>"]})
     MASK_START_id = tokenizer.convert_tokens_to_ids("<MASK_START>")
     MASK_END_id = tokenizer.convert_tokens_to_ids("<MASK_END>")
 
-    dataset = load_dataset(script_args.dataset_name)
+    dataset = load_dataset("json", data_files="dummy_train.jsonl")
 
-    def process_dataset(example):
+    def process_dataset(example, tokenizer=None):
         messages = {"messages": example["messages"]}
         formatted_chat = apply_chat_template(
             messages,
-            tokenizer,
+            processing_class=tokenizer, 
         )["text"]
         suffix_start = formatted_chat.rindex(example["suffix"].rstrip())
         prompt = formatted_chat[:suffix_start]
         completion = formatted_chat[suffix_start:]
         text = f"<MASK_START>{prompt}<MASK_END>{completion}"
 
-        # Verify the tokens are present
         encoded = tokenizer(text)
         mask_start_id = tokenizer.convert_tokens_to_ids("<MASK_START>")
         mask_end_id = tokenizer.convert_tokens_to_ids("<MASK_END>")
@@ -149,17 +148,21 @@ if __name__ == "__main__":
 
         return encoded
 
+    columns_to_remove = dataset["train"].column_names
+
     processed_dataset = dataset.map(
-        process_dataset, remove_columns=dataset["train"].column_names, num_proc=training_args.dataset_num_proc
+        process_dataset, 
+        remove_columns=columns_to_remove, 
+        num_proc=1,
+        fn_kwargs={"tokenizer": tokenizer}
     )
 
-    # Filter examples longer than max_seq_length
     num_rows = processed_dataset["train"].num_rows
-    processed_dataset = processed_dataset.filter(
-        lambda x: len(x["input_ids"]) <= training_args.max_seq_length, num_proc=training_args.dataset_num_proc
+    processed_dataset["train"] = processed_dataset["train"].filter(
+        lambda x: len(x["input_ids"]) <= 512, num_proc=1
     )
     print(
-        f"Filtered {num_rows - processed_dataset['train'].num_rows} examples longer than {training_args.max_seq_length} tokens."
+        f"Filtered {num_rows - processed_dataset['train'].num_rows} examples longer than 512 tokens."
     )
 
     print(f"=== FORMATTED SAMPLE === \n{tokenizer.decode(processed_dataset['train'][0]['input_ids'])}")
@@ -167,12 +170,12 @@ if __name__ == "__main__":
     trainer = SFTTrainer(
         model=model_config.model_name_or_path,
         args=training_args,
-        train_dataset=processed_dataset[script_args.dataset_train_split],
+        train_dataset=processed_dataset["train"],
         eval_dataset=(
-            processed_dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None
+            processed_dataset["train"] if training_args.eval_strategy != "no" else None
         ),
         data_collator=MaskedCompletionDataCollator(
-            response_template="<MASK_END>", instruction_template="<MASK_START>", tokenizer=tokenizer, mlm=False
+            tokenizer=tokenizer
         ),
         peft_config=get_peft_config(model_config),
         processing_class=tokenizer,

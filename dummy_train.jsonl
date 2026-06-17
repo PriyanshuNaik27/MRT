@@ -1,0 +1,2 @@
+{"messages": [{"role": "user", "content": "What is 2 + 2?"}, {"role": "assistant", "content": "The answer is 4."}], "suffix": "The answer is 4."}
+{"messages": [{"role": "user", "content": "Complete the sequence: A, B, C,"}, {"role": "assistant", "content": "The next letter is D."}], "suffix": "The next letter is D."}
